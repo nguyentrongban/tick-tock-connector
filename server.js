@@ -67,7 +67,27 @@ function log(...args) {
   console.log(new Date().toISOString(), ...args)
 }
 
+// ── Bộ đệm event để game bắt kịp sau khi rớt mạng ─────────────────────────
+// iPhone tự tắt tab game ở dưới nền → WebSocket rớt, event gửi đúng lúc đó
+// sẽ mất. Connector giữ lại event 5 phút gần nhất (tối đa 200); game nối
+// lại sẽ gửi {type:'sync', lastSeq} và nhận lại các event còn thiếu.
+// Mỗi event có số thứ tự tăng dần (seq) để game bỏ qua event trùng.
+const CATCHUP_KEEP_MS = 5 * 60 * 1000
+const CATCHUP_MAX = 200
+const CATCHUP_TYPES = new Set(['chat', 'gift', 'like', 'join', 'follow', 'share'])
+let eventSeq = 0
+const recentEvents = []
+
 function broadcast(obj) {
+  if (obj && CATCHUP_TYPES.has(obj.type)) {
+    eventSeq += 1
+    obj.seq = eventSeq
+    obj.t = Date.now()
+    recentEvents.push(obj)
+    const cutoff = Date.now() - CATCHUP_KEEP_MS
+    while (recentEvents.length && recentEvents[0].t < cutoff) recentEvents.shift()
+    if (recentEvents.length > CATCHUP_MAX) recentEvents.splice(0, recentEvents.length - CATCHUP_MAX)
+  }
   const text = JSON.stringify(obj)
   for (const ws of clients) {
     if (ws.readyState === 1) {
@@ -150,6 +170,16 @@ wss.on('connection', (ws) => {
     tiktok: tiktokState,
     roomId,
   }))
+  // Game nối lại sau khi rớt mạng (vd: tab Safari ở dưới nền bị iPhone tắt):
+  // nó gửi {type:'sync', lastSeq} — trả lại các event nó chưa nhận, tối đa 200.
+  ws.on('message', (data) => {
+    let msg
+    try { msg = JSON.parse(String(data)) } catch { return }
+    if (!msg || msg.type !== 'sync') return
+    const lastSeq = Number(msg.lastSeq) || 0
+    const missed = recentEvents.filter((e) => e.seq > lastSeq).slice(-CATCHUP_MAX)
+    try { ws.send(JSON.stringify({ type: 'catchup', events: missed })) } catch { /* bỏ qua */ }
+  })
   ws.on('close', () => {
     clients.delete(ws)
     log(`Game đã ngắt (còn ${clients.size} kết nối)`)
