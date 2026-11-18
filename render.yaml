@@ -3,12 +3,14 @@ services:
     name: tick-tock-defuse-connector
     env: node
     plan: free
-    buildCommand: npm install && npm run build:ttl-live
+    buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: NODE_VERSION
         value: 22
       - key: TIKTOK_USERNAME
+        sync: false
+      - key: EULER_API_KEY
         sync: false
       - key: ACCESS_CODE
         generateValue: true

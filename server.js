@@ -2,27 +2,48 @@
 // Nghe live TikTok của streamer rồi đẩy bình luận / quà / tim / follow / vào
 // phòng sang game qua WebSocket. Game nối tới:  wss://<app>.onrender.com/ws?key=<ACCESS_CODE>
 //
-// Cách nối TikTok: gói ttl-live tự ký ẩn danh bằng tài khoản khách của TikTok
-// (không cần đăng nhập, không cần chìa khóa Euler, không cần máy ký riêng).
-// Gói này được mang kèm trong thư mục ttl-live/ và build lúc deploy.
+// Cách nối TikTok (MANAGED WebSocket qua Euler, gói Community miễn phí):
+//   1. Lấy roomId TRỰC TIẾP từ TikTok (không qua Euler): kiểm tra user có đang
+//      live không rồi lấy roomId bằng các route HTML/API của tiktok-live-connector.
+//      Đường dự phòng qua Euler trong các route này đã TẮT hẳn.
+//   2. Gọi Euler rooms.fetchWebcastURL(roomId) bằng tiktok-live-api-sdk —
+//      Euler trả về gói protobuf ProtoMessageFetchResult (đường nối WebSocket
+//      TikTok + con trỏ/cursor + message ban đầu). Đường này dùng được với key
+//      Community miễn phí (đã kiểm chứng: trả 200). Đường KÝ trực tiếp
+//      (fetchWebcastSignature) thì KHÔNG dùng được với key miễn phí nên bỏ hẳn.
+//   3. Mở WebSocket tới đường nối đó bằng WebSocket client của chính
+//      tiktok-live-connector (tự lo nhịp tim, ack, giải mã protobuf). IP máy
+//      mình chỉ chạm vào TikTok ở bước 1 (đọc trang live, giống mở web thường);
+//      đường WebSocket do Euler cấp.
+// Không cần cookie đăng nhập TikTok.
 //
 // Biến môi trường:
-//   TIKTOK_USERNAME  tên TikTok của streamer, không cần @ (vd: nguyentrongtan)
-//   TTL_SESSION_COOKIE  cookie đăng nhập TikTok ("sessionid=...; ...") — bắt buộc
-//                    vì TikTok từ chối khách ẩn danh từ máy chủ thuê; bỏ trống
-//                    thì thử bằng khách (thường bị từ chối).
+//   TIKTOK_USERNAME  tên TikTok của streamer, không cần @ (vd: ineed3_)
+//   EULER_API_KEY    chìa khóa API Euler Stream (lấy ở eulerstream.com) — bắt buộc
 //   ACCESS_CODE      mật khẩu nối WebSocket — Render tự sinh khi deploy bằng Blueprint
 //   PORT             Render tự cấp (mặc định 10000)
 //   TEST_MODE=1      không nối TikTok thật — tự phát event giả mỗi vài giây để test game
 //
-// Chạy local:  TIKTOK_USERNAME=xxx ACCESS_CODE=test123 node server.js
+// Chạy local:  TIKTOK_USERNAME=xxx EULER_API_KEY=xxx ACCESS_CODE=test123 node server.js
 
 import http from 'node:http'
 import { WebSocketServer } from 'ws'
-import { TikTokLive, classifySocialAction } from './ttl-live/dist/index.js'
+import TikTokLiveApiSdk from 'tiktok-live-api-sdk'
+import {
+  WebcastHttpClient, getWebConfig, getRandomPresets,
+  getWebSocketConfigDefaults, createWebSocketProvider,
+  fetchRoomIdComposite, fetchIsLiveComposite,
+  RoomIdRouteConfig, IsLiveRouteConfig,
+  deserializeMessage, ControlAction, LIBRARY_IDENTITY,
+} from 'tiktok-live-connector'
+
+// TẮT hẳn đường dự phòng qua Euler khi lấy roomId / kiểm tra live:
+// chỉ dùng HTML + API trực tiếp của TikTok.
+RoomIdRouteConfig.skipFetchRoomIdFromEulerRoute = true
+IsLiveRouteConfig.skipFetchRoomIdFromEulerRoute = true
 
 const USERNAME = (process.env.TIKTOK_USERNAME || '').replace(/^@/, '').trim()
-const SESSION_COOKIE = (process.env.TTL_SESSION_COOKIE || '').trim()
+const EULER_API_KEY = (process.env.EULER_API_KEY || '').trim()
 const ACCESS_CODE = (process.env.ACCESS_CODE || '').trim()
 const PORT = Number(process.env.PORT || 10000)
 const TEST_MODE = process.env.TEST_MODE === '1'
@@ -32,8 +53,15 @@ let tiktokState = TEST_MODE ? 'test' : 'connecting' // live | offline | connecti
 let roomId = null
 let clients = new Set()
 let startedAt = Date.now()
-let live = null
+let live = null // WebcastWebSocketClient đang nối TikTok (hoặc null)
 let retryTimer = null
+let decodeFailCount = 0
+
+// Client TikTok trực tiếp (bước 1) + client WebSocket (bước 3), dựng 1 lần.
+const presets = getRandomPresets()
+const webClient = new WebcastHttpClient(getWebConfig(presets))
+const wsProvider = createWebSocketProvider(getWebSocketConfigDefaults(presets))
+const euler = new TikTokLiveApiSdk({ apiKey: EULER_API_KEY })
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
@@ -48,11 +76,17 @@ function broadcast(obj) {
   }
 }
 
-function who(user) {
+// Lấy thông tin người xem từ event TikTok.
+// Event đã giải mã của tiktok-live-connector: user lồng trong data.user,
+// tên hiển thị ở displayId, id ở idStr (đọc thêm cả tên cũ uniqueId/userId để
+// chắc chắn nếu thư viện đổi tên field trong bản sau).
+function who(data) {
+  const user = data?.user ?? data ?? {}
+  const uniqueId = user?.displayId || user?.uniqueId || ''
   return {
-    nickname: user?.nickname || user?.uniqueId || 'Khán giả',
-    uniqueId: user?.uniqueId || '',
-    userId: String(user?.userId || user?.uniqueId || ''),
+    nickname: user?.nickname || uniqueId || 'Khán giả',
+    uniqueId,
+    userId: String(user?.idStr ?? user?.userId ?? user?.id ?? uniqueId),
   }
 }
 
@@ -126,7 +160,120 @@ wss.on('connection', (ws) => {
 // Giữ kết nối sống: ping mỗi 30s (game tự bỏ qua ping)
 setInterval(() => broadcast({ type: 'ping', t: Date.now() }), 30_000)
 
-// ── TikTok LIVE (ttl-live, ký ẩn danh, không cần đăng nhập) ──────────────
+// ── TikTok LIVE (Euler MANAGED WebSocket, key Community miễn phí) ──────────
+
+// Đẩy 1 event TikTok đã giải mã sang game (đúng shape broadcast cũ).
+function handleDecoded({ type, data }) {
+  switch (type) {
+    case 'WebcastChatMessage':
+      broadcast({ type: 'chat', ...who(data), comment: data.content ?? data.comment ?? '' })
+      break
+    case 'WebcastGiftMessage': {
+      // Quà tặng theo chuỗi TikTok gửi 2 lần: đang tặng + tặng xong.
+      // Chỉ gửi lần cuối để game không cộng giờ 2 lần cho 1 món quà.
+      // Theo tài liệu thư viện: chỉ quà giftType 1 mới có chuỗi, nên bỏ qua
+      // event giữa chuỗi (repeatEnd chưa xong) của đúng loại quà đó.
+      const giftType = data.gift?.type ?? data.giftType
+      if (giftType === 1 && !data.repeatEnd) break
+      broadcast({
+        type: 'gift',
+        ...who(data),
+        giftName: data.gift?.name || data.giftName || 'Quà tặng',
+        giftId: data.giftId ?? null,
+        diamondCount: Number(data.gift?.diamondCount ?? data.diamondCount ?? 1) || 1,
+        repeatCount: Number(data.repeatCount || 1),
+        repeatEnd: !!data.repeatEnd,
+      })
+      break
+    }
+    case 'WebcastLikeMessage':
+      broadcast({
+        type: 'like',
+        ...who(data),
+        likeCount: Number(data.count ?? data.likeCount ?? 1),
+        totalLikeCount: Number(data.total ?? data.totalLikeCount ?? 0),
+      })
+      break
+    case 'WebcastMemberMessage':
+      broadcast({ type: 'join', ...who(data) })
+      break
+    case 'WebcastSocialMessage': {
+      // Thư viện cũ tự tách social thành follow / share (dựa theo displayText
+      // của TikTok) — làm lại đúng luật đó ở đây.
+      const key = data.common?.displayText?.key || ''
+      if (key.includes('follow')) broadcast({ type: 'follow', ...who(data) })
+      else if (key.includes('share')) broadcast({ type: 'share', ...who(data) })
+      break
+    }
+    case 'WebcastControlMessage':
+      // Live kết thúc hoặc bị tạm dừng: đóng nối để thử lại sau 30 giây.
+      if (data.action === ControlAction.CONTROL_ACTION_STREAM_ENDED ||
+          data.action === ControlAction.CONTROL_ACTION_STREAM_SUSPENDED) {
+        log('Phòng live đã kết thúc — thử lại sau 30 giây')
+        try { live?.close() } catch { /* close sẽ tự thử lại */ }
+      }
+      break
+    default:
+      // Các loại event khác (roomUser, barrage, system...) game không dùng.
+      break
+  }
+}
+
+// Đẩy các message trong 1 gói ProtoMessageFetchResult sang game.
+function handleFetchResult(result) {
+  for (const message of result?.messages || []) {
+    if (!message.decodedData) continue
+    try {
+      handleDecoded(message.decodedData)
+    } catch (err) {
+      log(`Bỏ qua 1 event TikTok lỗi: ${err?.message || err}`)
+    }
+  }
+}
+
+// Mở WebSocket tới đường nối Euler đã cấp (client của thư viện tự lo
+// nhịp tim, ack và giải mã protobuf).
+function openManagedWs(pushServer, wsParams, cookieHeader) {
+  const wsClient = wsProvider({
+    roomId,
+    baseUrl: pushServer,
+    wsParams,
+    wsHeaders: { Cookie: cookieHeader || '' },
+  })
+  live = wsClient
+
+  wsClient.on('open', () => {
+    tiktokState = 'live'
+    log(`Đã vào phòng live của @${USERNAME} (roomId ${roomId})`)
+    broadcast({ type: 'welcome', service: 'tick-tock-defuse-connector', username: USERNAME, tiktok: 'live', roomId })
+    try { wsClient.switchRooms(roomId) } catch { /* nối lại sẽ thử tiếp */ }
+  })
+  wsClient.on('protoMessageFetchResult', (result) => handleFetchResult(result))
+  wsClient.on('imEnteredRoom', () => {
+    log(`Đã vào phòng live của @${USERNAME} (roomId ${roomId})`)
+  })
+  wsClient.on('messageDecodingFailed', (err) => {
+    decodeFailCount++
+    if (decodeFailCount <= 3) log(`Không đọc được 1 gói tin TikTok (${decodeFailCount}): ${err?.message || err}`)
+  })
+  wsClient.on('unexpected-response', (_req, res) => {
+    log(`TikTok từ chối nối WebSocket (mã ${res?.statusCode || '?'}) — thử lại sau 30 giây`)
+    try { wsClient.close() } catch { /* close sẽ tự thử lại */ }
+  })
+  wsClient.on('close', (code) => {
+    if (live !== wsClient) return
+    live = null
+    tiktokState = 'offline'
+    roomId = null
+    log(`Đường nối TikTok đóng (${code}) — thử lại sau 30 giây`)
+    scheduleRetry(`đường nối đóng (${code})`)
+  })
+  wsClient.on('error', (err) => {
+    log(`Lỗi đường nối TikTok: ${err?.message || err}`)
+    // 'close' sẽ chạy theo sau và tự thử lại, nên ở đây chỉ ghi log.
+  })
+}
+
 async function connectTikTok() {
   if (TEST_MODE) return
   if (!USERNAME) {
@@ -134,84 +281,65 @@ async function connectTikTok() {
     log('Chưa có TIKTOK_USERNAME — đợi cấu hình rồi khởi động lại service')
     return
   }
+  if (!EULER_API_KEY) {
+    tiktokState = 'offline'
+    log('Chưa có EULER_API_KEY — chưa nối được TikTok, sẽ thử lại sau 30 giây')
+    scheduleRetry('thiếu EULER_API_KEY')
+    return
+  }
   if (live) {
-    try { live.disconnect() } catch { /* ignore */ }
+    try { live.close() } catch { /* ignore */ }
     live = null
   }
   tiktokState = 'connecting'
-  log(`Đang nối TikTok LIVE của @${USERNAME} (${SESSION_COOKIE ? 'bằng tài khoản đã đăng nhập' : 'khách ẩn danh, tự ký'})…`)
-  const conn = new TikTokLive(USERNAME, SESSION_COOKIE ? { sessionCookie: SESSION_COOKIE } : {})
-  live = conn
-
-  conn.on('chat', (data) => {
-    broadcast({ type: 'chat', ...who(data.user), comment: data.comment || '' })
-  })
-  conn.on('gift', (data) => {
-    // Quà tặng theo chuỗi TikTok gửi 2 lần: đang tặng + tặng xong.
-    // Chỉ gửi lần cuối để game không cộng giờ 2 lần cho 1 món quà.
-    if (data.streakable && !data.repeatEnd) return
-    broadcast({
-      type: 'gift',
-      ...who(data.user),
-      giftName: data.giftName || 'Quà tặng',
-      giftId: data.giftId ?? null,
-      diamondCount: Number(data.diamondCount ?? 1) || 1,
-      repeatCount: Number(data.repeatCount || 1),
-      repeatEnd: !!data.repeatEnd,
-    })
-  })
-  conn.on('like', (data) => {
-    broadcast({
-      type: 'like',
-      ...who(data.user),
-      likeCount: Number(data.count || 1),
-      totalLikeCount: Number(data.total || 0),
-    })
-  })
-  conn.on('member', (data) => {
-    broadcast({ type: 'join', ...who(data.user) })
-  })
-  conn.on('social', (data) => {
-    const kind = classifySocialAction(data.action).kind
-    if (kind === 'follow') broadcast({ type: 'follow', ...who(data.user) })
-    else if (kind === 'share') broadcast({ type: 'share', ...who(data.user) })
-  })
-  conn.on('connected', (state) => {
-    roomId = state.roomId || null
-    tiktokState = 'live'
-    log(`Đã vào phòng live của @${USERNAME} (roomId ${roomId}, ${state.giftCount} loại quà)`)
-    broadcast({ type: 'welcome', service: 'tick-tock-defuse-connector', username: USERNAME, tiktok: 'live', roomId })
-  })
-  conn.on('reconnecting', ({ attempt, delayMs }) => {
-    tiktokState = 'connecting'
-    log(`TikTok mất kết nối — thử nối lại lần ${attempt} sau ${delayMs}ms`)
-  })
-  conn.on('disconnected', ({ code }) => {
-    tiktokState = 'offline'
-    roomId = null
-    log(`TikTok ngắt kết nối (${code}) — gói tự nối lại, nếu hết lượt sẽ thử mới`)
-  })
-  conn.on('error', (err) => {
-    log(`Lỗi TikTok: ${err.message}`)
-    if (!conn.connected) {
-      live = null
-      try { conn.disconnect() } catch { /* ignore */ }
-      scheduleRetry(err.message)
-    }
-  })
-
   try {
-    const state = await conn.connect()
-    roomId = state.roomId || null
-    tiktokState = 'live'
-    log(`Đã vào phòng live của @${USERNAME} (roomId ${roomId}, ${state.giftCount} loại quà)`)
-    broadcast({ type: 'welcome', service: 'tick-tock-defuse-connector', username: USERNAME, tiktok: 'live', roomId })
+    // Bước 1: user có đang live không + roomId — TRỰC TIẾP từ TikTok.
+    log(`Đang kiểm tra @${USERNAME} có đang live không…`)
+    const isLive = await fetchIsLiveComposite({ uniqueId: USERNAME, webClient, apiClient: webClient.apiClient })
+    if (!isLive) {
+      tiktokState = 'offline'
+      roomId = null
+      log(`@${USERNAME} chưa live — thử lại sau 30 giây`)
+      scheduleRetry('chưa live')
+      return
+    }
+    roomId = await fetchRoomIdComposite({ uniqueId: USERNAME, webClient, apiClient: webClient.apiClient })
+    log(`@${USERNAME} đang live (roomId ${roomId}) — đang lấy đường nối qua Euler…`)
+
+    // Bước 2: Euler cấp đường nối WebSocket + con trỏ + message ban đầu.
+    const res = await euler.rooms.fetchWebcastURL(
+      String(roomId), LIBRARY_IDENTITY, undefined,
+      webClient.clientHeaders?.['User-Agent'], true, 'web',
+      undefined, undefined, { responseType: 'arraybuffer' },
+    )
+    if (res.status !== 200) throw new Error(`Euler trả mã ${res.status}`)
+    const fetchResult = deserializeMessage('ProtoMessageFetchResult', Buffer.from(res.data))
+    if (!fetchResult.pushServer || !fetchResult.cursor) {
+      throw new Error('Euler không trả đủ thông tin nối phòng')
+    }
+    if (res.headers?.['x-set-tt-cookie']) {
+      try { await webClient.cookieJar.processSetCookieHeader(res.headers['x-set-tt-cookie']) } catch { /* nối không cookie vẫn thử */ }
+    }
+    if (res.headers?.['x-room-id']) roomId = res.headers['x-room-id']
+    handleFetchResult(fetchResult)
+
+    // Bước 3: mở WebSocket (client của thư viện tự lo nhịp tim/ack/giải mã).
+    let cookieHeader = ''
+    try { cookieHeader = await webClient.cookieJar.getAnonymousCookieString() } catch { /* nối không cookie vẫn thử */ }
+    const wsParams = {
+      compress: 'gzip',
+      room_id: roomId,
+      internal_ext: fetchResult.internalExt,
+      cursor: fetchResult.cursor,
+      ...(fetchResult.routeParams || {}),
+    }
+    openManagedWs(fetchResult.pushServer, wsParams, cookieHeader)
   } catch (err) {
     tiktokState = 'offline'
-    log(`Chưa nối được TikTok (@${USERNAME} có thể chưa live): ${err.message}`)
+    roomId = null
+    log(`Chưa nối được TikTok: ${err?.message || err}`)
     live = null
-    try { conn.disconnect() } catch { /* ignore */ }
-    scheduleRetry(err.message)
+    scheduleRetry(err?.message || 'không nối được')
   }
 }
 
@@ -248,7 +376,7 @@ if (TEST_MODE) {
 }
 
 server.listen(PORT, () => {
-  log(`Connector chạy ở cổng ${PORT} — TikTok: @${USERNAME || '(chưa cấu hình)'} — TEST_MODE=${TEST_MODE ? 'bật' : 'tắt'}`)
+  log(`Connector chạy ở cổng ${PORT} — TikTok: @${USERNAME || '(chưa cấu hình)'} — Euler: ${EULER_API_KEY ? 'đã có key' : 'CHƯA CÓ KEY'} — TEST_MODE=${TEST_MODE ? 'bật' : 'tắt'}`)
   if (!ACCESS_CODE) log('CẢNH BÁO: chưa đặt ACCESS_CODE — ai cũng nối được WebSocket!')
   connectTikTok()
 })
