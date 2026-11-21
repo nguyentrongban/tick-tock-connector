@@ -96,6 +96,27 @@ function broadcast(obj) {
   }
 }
 
+// Lấy URL ảnh đại diện từ event TikTok.
+// Dạng protobuf thô (deserializeMessage): user.avatarLarge là object Image
+// có urlList (mảng link, ưu tiên ảnh 100x100). Dạng đã đơn giản hóa của
+// thư viện: profilePictureUrl là chuỗi sẵn. TikTok gửi kèm ảnh với mọi
+// bình luận/quà/tim — game dùng nó làm avatar trên đầu nhân vật, không có
+// thì game tự vẽ vòng tròn màu + chữ cái đầu tên.
+function pickAvatarUrl(user) {
+  if (!user) return ''
+  if (typeof user.profilePictureUrl === 'string' && user.profilePictureUrl) return user.profilePictureUrl
+  const pic = user.avatarLarge || user.profilePicture || user.avatarThumb || user.avatar
+  if (typeof pic === 'string' && pic) return pic
+  const list = pic?.urlList || pic?.urls
+  if (Array.isArray(list) && list.length) {
+    return list.find((u) => typeof u === 'string' && u.includes('100x100') && u.includes('.webp'))
+      || list.find((u) => typeof u === 'string' && u.includes('100x100'))
+      || list.find((u) => typeof u === 'string' && u)
+      || ''
+  }
+  return ''
+}
+
 // Lấy thông tin người xem từ event TikTok.
 // Event đã giải mã của tiktok-live-connector: user lồng trong data.user,
 // tên hiển thị ở displayId, id ở idStr (đọc thêm cả tên cũ uniqueId/userId để
@@ -107,6 +128,7 @@ function who(data) {
     nickname: user?.nickname || uniqueId || 'Khán giả',
     uniqueId,
     userId: String(user?.idStr ?? user?.userId ?? user?.id ?? uniqueId),
+    avatar: pickAvatarUrl(user),
   }
 }
 
